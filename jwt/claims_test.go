@@ -1,0 +1,179 @@
+/*-
+ * Copyright 2016 Zbigniew Mandziejewicz
+ * Copyright 2016 Square, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package jwt
+
+import (
+	"encoding/json/v2"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/go-jose/go-jose/v5/testutils/assert"
+)
+
+func TestEncodeClaims(t *testing.T) {
+	now := time.Date(2016, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	c := Claims{
+		Issuer:    "issuer",
+		Subject:   "subject",
+		Audience:  Audience{"a1", "a2"},
+		NotBefore: NewNumericDate(time.Time{}),
+		IssuedAt:  NewNumericDate(now),
+		Expiry:    NewNumericDate(now.Add(1 * time.Hour)),
+	}
+
+	b, err := json.Marshal(c)
+	assert.NoError(t, err)
+
+	expected := `{"iss":"issuer","sub":"subject","aud":["a1","a2"],"exp":1451610000,"iat":1451606400}`
+	assert.Equal(t, expected, string(b))
+}
+
+func TestEncodeClaimsWithSingleAudience(t *testing.T) {
+	now := time.Date(2016, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	c := Claims{
+		Issuer:    "issuer",
+		Subject:   "subject",
+		Audience:  Audience{"a1"},
+		NotBefore: NewNumericDate(time.Time{}),
+		IssuedAt:  NewNumericDate(now),
+		Expiry:    NewNumericDate(now.Add(1 * time.Hour)),
+	}
+
+	b, err := json.Marshal(c)
+	assert.NoError(t, err)
+
+	expected := `{"iss":"issuer","sub":"subject","aud":"a1","exp":1451610000,"iat":1451606400}`
+	assert.Equal(t, expected, string(b))
+}
+
+func TestDecodeClaims(t *testing.T) {
+	s := []byte(`{"iss":"issuer","sub":"subject","aud":["a1","a2"],"exp":1451610000,"iat":1451606400}`)
+	now := time.Date(2016, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	c := Claims{}
+	if err := json.Unmarshal(s, &c); assert.NoError(t, err) {
+		assert.Equal(t, "issuer", c.Issuer)
+		assert.Equal(t, "subject", c.Subject)
+		assert.EqualSlice(t, Audience{"a1", "a2"}, c.Audience)
+		if !now.Equal(c.IssuedAt.Time()) {
+			t.Errorf("IssuedAt = %s, want %s", c.IssuedAt.Time(), now)
+		}
+		if !now.Add(1 * time.Hour).Equal(c.Expiry.Time()) {
+			t.Errorf("Expiry = %s, want %s", c.Expiry.Time(), now.Add(1*time.Hour))
+		}
+	}
+
+	s2 := []byte(`{"aud": "a1"}`)
+	c2 := Claims{}
+	if err := json.Unmarshal(s2, &c2); assert.NoError(t, err) {
+		assert.EqualSlice(t, Audience{"a1"}, c2.Audience)
+	}
+
+	invalid := []struct {
+		Raw string
+		Err error
+	}{
+		{`{"aud": 5}`, ErrUnmarshalAudience},
+		{`{"aud": ["foo", 5, "bar"]}`, ErrUnmarshalAudience},
+		{`{"exp": "invalid"}`, ErrUnmarshalNumericDate},
+	}
+
+	for _, v := range invalid {
+		c := Claims{}
+		err := json.Unmarshal([]byte(v.Raw), &c)
+		if !errors.Is(err, v.Err) {
+			t.Errorf("got error %#v, want something that wraps %#v", err, v.Err)
+		}
+	}
+}
+
+func TestNumericDate(t *testing.T) {
+	zeroDate := NewNumericDate(time.Time{})
+	if !zeroDate.Time().Equal(time.Time{}) {
+		t.Errorf("zeroDate.Time() = %s, want %s", zeroDate.Time(), time.Time{})
+	}
+
+	zeroDate2 := (*NumericDate)(nil)
+	if !zeroDate2.Time().Equal(time.Time{}) {
+		t.Errorf("zeroDate2.Time() = %s, want %s", zeroDate2.Time(), time.Time{})
+	}
+
+	nonZeroDate := NewNumericDate(time.Unix(0, 0))
+	expected := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+	if !nonZeroDate.Time().Equal(expected) {
+		t.Errorf("nonZeroDate.Time() = %s, want %s", nonZeroDate.Time(), expected)
+	}
+}
+
+func TestNumericDateOutOfRange(t *testing.T) {
+	// Values large enough to overflow the int64 conversion or time.Unix wrap
+	// to a bogus instant, so they must be rejected rather than stored. The
+	// 9.22e18 case fits in an int64 but still overflows time.Unix's internal
+	// offset.
+	for _, raw := range []string{"1e19", "-1e19", "9.3e18", "9223372036800000000", "1e300"} {
+		var nd NumericDate
+		assert.ErrorIs(t, nd.UnmarshalJSON([]byte(raw)), ErrUnmarshalNumericDate)
+	}
+
+	// In-range values, including fractional seconds, still parse.
+	var nd NumericDate
+	if assert.NoError(t, nd.UnmarshalJSON([]byte("1451606400.5"))) {
+		assert.Equal(t, int64(1451606400), int64(nd))
+	}
+}
+
+// TestOutOfRangeNbfNotBeforeCheck guards against an out-of-range "nbf" being
+// silently accepted. Before the range check in UnmarshalJSON, {"nbf": 1e19}
+// overflowed to a value that time.Unix wrapped into the past, so Validate
+// accepted a token that is not yet valid; it must now fail to decode.
+func TestOutOfRangeNbfNotBeforeCheck(t *testing.T) {
+	var c Claims
+	assert.ErrorIs(t, json.Unmarshal([]byte(`{"nbf": 1e19}`), &c), ErrUnmarshalNumericDate)
+}
+
+func TestEncodeClaimsTimeValues(t *testing.T) {
+	now := time.Date(2016, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	c := Claims{
+		NotBefore: NewNumericDate(time.Time{}),
+		IssuedAt:  NewNumericDate(time.Unix(0, 0)),
+		Expiry:    NewNumericDate(now),
+	}
+
+	b, err := json.Marshal(c)
+	assert.NoError(t, err)
+
+	expected := `{"exp":1451606400,"iat":0}`
+	assert.Equal(t, expected, string(b))
+
+	c2 := Claims{}
+	if err := json.Unmarshal(b, &c2); assert.NoError(t, err) {
+		if !c.NotBefore.Time().Equal(c2.NotBefore.Time()) {
+			t.Errorf("c2.NotBefore = %s, want %s", c2.NotBefore.Time(), c.NotBefore.Time())
+		}
+		if !c.IssuedAt.Time().Equal(c2.IssuedAt.Time()) {
+			t.Errorf("c2.IssuedAt = %s, want %s", c2.IssuedAt.Time(), c.IssuedAt.Time())
+		}
+		if !c.Expiry.Time().Equal(c2.Expiry.Time()) {
+			t.Errorf("c2.Expiry = %s, want %s", c2.Expiry.Time(), c.Expiry.Time())
+		}
+	}
+}
