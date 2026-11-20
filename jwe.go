@@ -19,6 +19,7 @@ package jose
 import (
 	"encoding/base64"
 	jsonv1 "encoding/json"
+	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
@@ -32,6 +33,18 @@ import (
 // If modifying MaxRecipients, do it before any parsing occurs.
 var MaxRecipients = 32
 
+// ErrConflictingRecipientMembers is returned when a JWE JSON Serialization
+// object combines the general serialization's "recipients" array with the
+// flattened serialization's top-level "header" or "encrypted_key" members.
+//
+// RFC 7516 Section 7.2.1 defines "header" and "encrypted_key" as members of
+// the flattened syntax only, and Section 7.2.2 makes them mutually exclusive
+// with "recipients". Accepting both would leave the owner of an encrypted key
+// ambiguous, so such messages are rejected rather than silently dropping the
+// top-level members.
+var ErrConflictingRecipientMembers = errors.New(
+	`go-jose/go-jose: "recipients" is mutually exclusive with top-level "header" and "encrypted_key"`)
+
 // rawJSONWebEncryption represents a raw JWE JSON object. Used for parsing/serializing.
 type rawJSONWebEncryption struct {
 	Protected    *byteBuffer        `json:"protected,omitempty"`
@@ -43,6 +56,36 @@ type rawJSONWebEncryption struct {
 	Iv           *byteBuffer        `json:"iv,omitempty"`
 	Ciphertext   *byteBuffer        `json:"ciphertext,omitempty"`
 	Tag          *byteBuffer        `json:"tag,omitempty"`
+
+	// Presence flags record whether the corresponding members appeared in the
+	// parsed JSON, including explicit nulls. The pointers above cannot
+	// distinguish an absent member from a null one, but the mutual exclusion of
+	// RFC 7516 Section 7.2.2 applies to the members themselves. The flags are
+	// never serialized.
+	hasRecipients   bool
+	hasHeader       bool
+	hasEncryptedKey bool
+}
+
+// UnmarshalJSON decodes a raw JWE while recording which of the recipient
+// members of RFC 7516 Section 7.2.1 were present in the input.
+func (parsed *rawJSONWebEncryption) UnmarshalJSON(data []byte) error {
+	type alias rawJSONWebEncryption
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+
+	var members map[string]jsontext.Value
+	if err := json.Unmarshal(data, &members); err != nil {
+		return err
+	}
+
+	*parsed = rawJSONWebEncryption(decoded)
+	_, parsed.hasRecipients = members["recipients"]
+	_, parsed.hasHeader = members["header"]
+	_, parsed.hasEncryptedKey = members["encrypted_key"]
+	return nil
 }
 
 // rawRecipientInfo represents a raw JWE Per-Recipient header JSON object. Used for parsing/serializing.
@@ -148,6 +191,10 @@ func ParseEncrypted(input string,
 // ParseEncryptedJSON parses a message in JWE JSON Serialization. Messages with
 // more than [MaxRecipients] recipients are rejected.
 //
+// A message that combines a "recipients" array with a top-level "header" or
+// "encrypted_key" member is rejected with [ErrConflictingRecipientMembers].
+// See RFC 7516 Section 7.2.2.
+//
 // https://datatracker.ietf.org/doc/html/rfc7516#section-3.2
 //
 // The keyAlgorithms and contentEncryption parameters contain the allowable algorithms in the "alg" and "enc"
@@ -181,6 +228,19 @@ func (parsed *rawJSONWebEncryption) sanitized(
 	if len(contentEncryption) == 0 {
 		return nil, errors.New("go-jose/go-jose: no content encryption algorithms provided")
 	}
+
+	// RFC 7516 Section 7.2.2: the "recipients" member of the general syntax is
+	// mutually exclusive with the "header" and "encrypted_key" members of the
+	// flattened syntax. Reject the combination outright instead of silently
+	// discarding the top-level members, which would leave the ownership of an
+	// encrypted key unverifiable.
+	if parsed.hasRecipients && parsed.hasHeader {
+		return nil, fmt.Errorf(`%w: found both "recipients" and "header"`, ErrConflictingRecipientMembers)
+	}
+	if parsed.hasRecipients && parsed.hasEncryptedKey {
+		return nil, fmt.Errorf(`%w: found both "recipients" and "encrypted_key"`, ErrConflictingRecipientMembers)
+	}
+
 	if len(parsed.Recipients) > MaxRecipients {
 		return nil, fmt.Errorf("go-jose/go-jose: too many recipients in JWE; maximum is %d", MaxRecipients)
 	}
@@ -379,22 +439,31 @@ func (obj JSONWebEncryption) CompactSerialize() (string, error) {
 // FullSerialize serializes an object using the full JSON serialization format.
 //
 // It returns "" if obj cannot be serialized, for example if it has no recipients.
+//
+// Objects with a single recipient use the flattened syntax of RFC 7516
+// Section 7.2.2, which carries "header" and "encrypted_key" as top-level
+// members. Objects with multiple recipients use the general syntax of
+// RFC 7516 Section 7.2.1, whose top-level member list does not include
+// "header" or "encrypted_key": every per-recipient header and encrypted key is
+// emitted inside the "recipients" array so that ownership stays explicit.
 func (obj JSONWebEncryption) FullSerialize() string {
 	if len(obj.recipients) == 0 {
 		return ""
 	}
 
 	raw := rawJSONWebEncryption{
-		Unprotected:  obj.unprotected,
-		Iv:           newBuffer(obj.iv),
-		Ciphertext:   newBuffer(obj.ciphertext),
-		EncryptedKey: newBuffer(obj.recipients[0].encryptedKey),
-		Tag:          newBuffer(obj.tag),
-		Aad:          newBuffer(obj.aad),
-		Recipients:   []rawRecipientInfo{},
+		Unprotected: obj.unprotected,
+		Iv:          newBuffer(obj.iv),
+		Ciphertext:  newBuffer(obj.ciphertext),
+		Tag:         newBuffer(obj.tag),
+		Aad:         newBuffer(obj.aad),
 	}
 
 	if len(obj.recipients) > 1 {
+		// General serialization. Deliberately leave Header and EncryptedKey
+		// unset: RFC 7516 Section 7.2.1 does not list them as top-level
+		// members of this syntax.
+		raw.Recipients = make([]rawRecipientInfo, 0, len(obj.recipients))
 		for _, recipient := range obj.recipients {
 			info := rawRecipientInfo{
 				Header:       recipient.header,
@@ -403,7 +472,7 @@ func (obj JSONWebEncryption) FullSerialize() string {
 			raw.Recipients = append(raw.Recipients, info)
 		}
 	} else {
-		// Use flattened serialization
+		// Flattened serialization
 		raw.Header = obj.recipients[0].header
 		raw.EncryptedKey = newBuffer(obj.recipients[0].encryptedKey)
 	}

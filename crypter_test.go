@@ -24,6 +24,9 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/hex"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -474,6 +477,100 @@ func TestMultiRecipientJWE(t *testing.T) {
 
 	if !bytes.Equal(input, output) {
 		t.Fatal("Decrypted output does not match input", output, input)
+	}
+}
+
+// TestMultiRecipientJWERecipientKeyOwnership checks that every recipient's
+// encrypted key produced by the multi-recipient encrypter belongs to that
+// recipient's entry in the general JWE JSON Serialization, and that messages
+// mixing "recipients" with the flattened top-level "header" or
+// "encrypted_key" members are rejected on the way back in.
+func TestMultiRecipientJWERecipientKeyOwnership(t *testing.T) {
+	otherKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generating second RSA key: %s", err)
+	}
+
+	enc, err := NewMultiEncrypter(A128GCM, []Recipient{
+		{Algorithm: RSA_OAEP, Key: &rsaTestKey.PublicKey},
+		{Algorithm: RSA_OAEP, Key: &otherKey.PublicKey},
+	}, nil)
+	if err != nil {
+		t.Fatalf("making multi-recipient encrypter: %s", err)
+	}
+
+	obj, err := enc.Encrypt([]byte("Lorem ipsum dolor sit amet"))
+	if err != nil {
+		t.Fatalf("encrypting to two recipients: %s", err)
+	}
+
+	msg := obj.FullSerialize()
+
+	var members map[string]jsontext.Value
+	if err := json.Unmarshal([]byte(msg), &members); err != nil {
+		t.Fatalf("parsing serialized JWE: %s", err)
+	}
+	if _, ok := members["encrypted_key"]; ok {
+		t.Errorf("multi-recipient JWE has top-level encrypted_key: %s", msg)
+	}
+	if _, ok := members["header"]; ok {
+		t.Errorf("multi-recipient JWE has top-level header: %s", msg)
+	}
+
+	var recipients []map[string]jsontext.Value
+	if err := json.Unmarshal(members["recipients"], &recipients); err != nil {
+		t.Fatalf("parsing recipients: %s", err)
+	}
+	if len(recipients) != 2 {
+		t.Fatalf("got %d recipients, want 2", len(recipients))
+	}
+
+	seen := make(map[string]struct{}, len(recipients))
+	for i, recipient := range recipients {
+		encryptedKey, ok := recipient["encrypted_key"]
+		if !ok {
+			t.Fatalf("recipient %d has no encrypted_key: %s", i, msg)
+		}
+		if _, dup := seen[string(encryptedKey)]; dup {
+			t.Errorf("recipient %d reuses another recipient's encrypted key", i)
+		}
+		seen[string(encryptedKey)] = struct{}{}
+	}
+
+	// Both keys must decrypt to the original plaintext, at their own indices.
+	input := []byte("Lorem ipsum dolor sit amet")
+	parsed, err := ParseEncrypted(msg, []KeyAlgorithm{RSA_OAEP}, []ContentEncryption{A128GCM})
+	if err != nil {
+		t.Fatalf("parsing multi-recipient JWE: %s", err)
+	}
+	for wantIndex, key := range []*rsa.PrivateKey{rsaTestKey, otherKey} {
+		index, _, output, err := parsed.DecryptMulti(key)
+		if err != nil {
+			t.Fatalf("decrypting with recipient %d key: %s", wantIndex, err)
+		}
+		if index != wantIndex {
+			t.Errorf("decrypted with recipient %d key at index %d", wantIndex, index)
+		}
+		if !bytes.Equal(input, output) {
+			t.Errorf("recipient %d plaintext = %q, want %q", wantIndex, output, input)
+		}
+	}
+
+	// The same boundary also holds on the parse entry point used by the
+	// encrypter roundtrip above, with a conflicting flattened member added.
+	for name, extra := range map[string]string{
+		"header":        `"header":{"kid":""},`,
+		"encrypted_key": `"encrypted_key":"AAAA",`,
+	} {
+		t.Run("rejects recipients with top-level "+name, func(t *testing.T) {
+			bad := `{"protected":"eyJlbmMiOiJBMTI4R0NNIn0",` + extra +
+				`"recipients":` + string(members["recipients"]) +
+				`,"iv":"AAAA","ciphertext":"AAAA","tag":"AAAA"}`
+			_, err := ParseEncrypted(bad, []KeyAlgorithm{RSA_OAEP}, []ContentEncryption{A128GCM})
+			if !errors.Is(err, ErrConflictingRecipientMembers) {
+				t.Fatalf("parsing tampered JWE with top-level %s: got %v, want %v", name, err, ErrConflictingRecipientMembers)
+			}
+		})
 	}
 }
 

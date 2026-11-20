@@ -51,6 +51,8 @@ func Example_jWE() {
 	}
 
 	// Serialize the encrypted object using the JWE JSON Serialization format.
+	// With a single recipient this uses the flattened syntax of RFC 7516
+	// Section 7.2.2, where "header" and "encrypted_key" are top-level members.
 	// Alternatively you can also use the compact format here by calling
 	// object.CompactSerialize() instead.
 	serialized := object.FullSerialize()
@@ -170,6 +172,57 @@ func ExampleNewMultiEncrypter() {
 		{Algorithm: A128GCMKW, Key: sharedKey},
 		{Algorithm: RSA_OAEP, Key: publicKey},
 	}, nil)
+}
+
+func ExampleNewMultiEncrypter_jWE() {
+	// Generate two independent key pairs, one per recipient.
+	firstKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		panic(err)
+	}
+	secondKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		panic(err)
+	}
+
+	// Instantiate an encrypter for both recipients.
+	encrypter, err := NewMultiEncrypter(A128GCM, []Recipient{
+		{Algorithm: RSA_OAEP, Key: &firstKey.PublicKey},
+		{Algorithm: RSA_OAEP, Key: &secondKey.PublicKey},
+	}, nil)
+	if err != nil {
+		panic(err)
+	}
+
+	object, err := encrypter.Encrypt([]byte("Lorem ipsum dolor sit amet"))
+	if err != nil {
+		panic(err)
+	}
+
+	// With multiple recipients, FullSerialize uses the general syntax of
+	// RFC 7516 Section 7.2.1. Its top-level members are "protected",
+	// "recipients", "iv", "ciphertext", "tag" (plus "unprotected" and "aad"
+	// when set). The flattened members "header" and "encrypted_key" are not
+	// part of that syntax: each recipient's header and encrypted key appear
+	// only in its own entry of the "recipients" array.
+	serialized := object.FullSerialize()
+
+	// Parse the serialized object back. A message that combined "recipients"
+	// with a top-level "header" or "encrypted_key" member would be rejected
+	// here with ErrConflictingRecipientMembers, as required by RFC 7516
+	// Section 7.2.2.
+	object, err = ParseEncryptedJSON(serialized, []KeyAlgorithm{RSA_OAEP}, []ContentEncryption{A128GCM})
+	if err != nil {
+		panic(err)
+	}
+
+	// Each recipient decrypts with its own key and learns its own index.
+	index, _, plaintext, err := object.DecryptMulti(secondKey)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("recipient %d: %s", index, plaintext)
+	// output: recipient 1: Lorem ipsum dolor sit amet
 }
 
 func ExampleNewMultiSigner() {

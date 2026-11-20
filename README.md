@@ -24,6 +24,52 @@ Older versions of this package used a forked version of `encoding/json`, but v5
 uses `encoding/json/v2`. It continues to have case-sensitive matching and
 rejection of duplicate field names.
 
+### Multi-recipient JWE structure
+
+JWE JSON Serialization has two syntaxes, and this package keeps their structural
+boundary strict in both directions:
+
+* A JWE with exactly one recipient is serialized with the **flattened** syntax
+  (RFC 7516 Section 7.2.2). Its top-level members include `header` and
+  `encrypted_key`.
+* A JWE with more than one recipient is serialized with the **general** syntax
+  (RFC 7516 Section 7.2.1). Its top-level members are `protected`,
+  `unprotected`, `recipients`, `aad`, `iv`, `ciphertext`, and `tag`. `header`
+  and `encrypted_key` are deliberately **not** emitted at the top level: every
+  recipient's header and encrypted key appear only in that recipient's own entry
+  of the `recipients` array, so the owner of each encrypted key is explicit.
+* On input, a message that combines a `recipients` array with a top-level
+  `header` or `encrypted_key` member is rejected with
+  `ErrConflictingRecipientMembers`. RFC 7516 Section 7.2.2 makes those members
+  mutually exclusive; silently discarding the flattened member would leave the
+  ownership of an encrypted key unverifiable. This error is distinct from the
+  errors reported for genuinely missing or invalid headers.
+
+Compact serialization is unaffected: it still supports only single-recipient
+objects and returns `ErrNotSupported` for multi-recipient ones.
+
+#### Migration note for older issuers
+
+Messages produced by older versions of this package (and by other
+implementations) may carry a top-level `encrypted_key` or `header` alongside a
+`recipients` array. The key at the top level is a copy of the first recipient's
+encrypted key; the raw per-recipient entries in the `recipients` array remain
+authoritative. Because such messages put the audit-relevant encrypted key in two
+places at once, they are now rejected at parse time rather than being quietly
+reinterpreted.
+
+To interoperate during the rollout, re-issue or rewrite affected messages so each
+encrypted key appears only inside its recipient entry: parse with an older
+release, drop the top-level `header`/`encrypted_key` members, and re-serialize
+(the general syntax produced by this release never reintroduces them). The
+alternative — silently preferring the `recipients` entries and dropping the
+top-level duplicate — was rejected because it makes the two readings
+indistinguishable to auditors and hides real disagreements between the duplicated
+fields. Accepting the mixed form only for messages whose top-level copy is
+byte-identical to the first recipient's key was also rejected: it adds a
+heuristic ownership rule and keeps two sources of truth in circulation
+indefinitely.
+
 ### Versions
 
 Version 5 is in development on the main branch of this repository.  It will be

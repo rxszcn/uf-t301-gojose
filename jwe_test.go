@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/json/jsontext"
@@ -27,6 +28,8 @@ import (
 	"errors"
 	"math/big"
 	"regexp"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -271,15 +274,19 @@ func TestRejectUnprotectedJWENonce(t *testing.T) {
 		t.Errorf("Improper error for unprotected nonce: %v", err)
 	}
 
-	// Full JSON
+	// Full JSON. Note: top-level headers may not be combined with
+	// "recipients" (RFC 7516 Section 7.2.2), so the algorithm headers live in
+	// the per-recipient header. The nonce check must still fire first.
 	input = `{
-		"header":  { "alg": "XYZ", "enc": "XYZ" },
 		"aad": "does-not-matter",
 		"iv": "does-not-matter",
 		"ciphertext": "does-not-matter",
 		"tag": "does-not-matter",
 		"recipients": [{
-			"header": { "nonce": "should-cause-an-error" },
+			"header": {
+				"alg": "XYZ", "enc": "XYZ",
+				"nonce": "should-cause-an-error"
+			},
 			"encrypted_key": "does-not-matter"
 		}]
 	}`
@@ -1210,6 +1217,177 @@ func TestFullSerializeNoRecipients(t *testing.T) {
 	if out := (JSONWebEncryption{}).FullSerialize(); out != "" {
 		t.Errorf("expected empty string, got %q", out)
 	}
+}
+
+// topLevelMembers returns the member names of a JSON object input.
+func topLevelMembers(t *testing.T, input string) map[string]jsontext.Value {
+	t.Helper()
+	var members map[string]jsontext.Value
+	if err := json.Unmarshal([]byte(input), &members); err != nil {
+		t.Fatalf("parsing JSON object %s: %s", input, err)
+	}
+	return members
+}
+
+// memberNames returns the sorted member names of members.
+func memberNames(members map[string]jsontext.Value) []string {
+	names := make([]string, 0, len(members))
+	for name := range members {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// TestJWEBoundarySerializationMatrix exercises the structural boundary between
+// the flattened and general JWE JSON Serialization syntaxes of RFC 7516
+// Section 7.2. The matrix follows from Section 7.2.2: "recipients" is mutually
+// exclusive with the top-level "header" and "encrypted_key" members.
+func TestJWEBoundarySerializationMatrix(t *testing.T) {
+	// Two independent RSA recipients, each with its own public key.
+	otherKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generating second RSA key: %s", err)
+	}
+
+	newMultiRecipientJWE := func(t *testing.T) *JSONWebEncryption {
+		t.Helper()
+		enc, err := NewMultiEncrypter(A128GCM, []Recipient{
+			{Algorithm: RSA_OAEP, Key: &rsaTestKey.PublicKey},
+			{Algorithm: RSA_OAEP, Key: &otherKey.PublicKey},
+		}, nil)
+		if err != nil {
+			t.Fatalf("making multi-recipient encrypter: %s", err)
+		}
+		obj, err := enc.Encrypt([]byte("Lorem ipsum dolor sit amet"))
+		if err != nil {
+			t.Fatalf("encrypting to two recipients: %s", err)
+		}
+		return obj
+	}
+
+	newSingleRecipientJWE := func(t *testing.T) *JSONWebEncryption {
+		t.Helper()
+		enc, err := NewEncrypter(A128GCM, Recipient{Algorithm: RSA_OAEP, Key: &rsaTestKey.PublicKey}, nil)
+		if err != nil {
+			t.Fatalf("making single-recipient encrypter: %s", err)
+		}
+		obj, err := enc.Encrypt([]byte("Lorem ipsum dolor sit amet"))
+		if err != nil {
+			t.Fatalf("encrypting to one recipient: %s", err)
+		}
+		return obj
+	}
+
+	t.Run("multi-recipient output has no flattened top-level members", func(t *testing.T) {
+		obj := newMultiRecipientJWE(t)
+		msg := obj.FullSerialize()
+
+		members := topLevelMembers(t, msg)
+		for _, name := range []string{"header", "encrypted_key"} {
+			if _, ok := members[name]; ok {
+				t.Errorf("general serialization has top-level %q member: %s", name, msg)
+			}
+		}
+		for _, name := range []string{"protected", "recipients", "iv", "ciphertext", "tag"} {
+			if _, ok := members[name]; !ok {
+				t.Errorf("general serialization is missing top-level %q member: %s", name, msg)
+			}
+		}
+
+		var recipients []map[string]jsontext.Value
+		if err := json.Unmarshal(members["recipients"], &recipients); err != nil {
+			t.Fatalf("parsing recipients array: %s", err)
+		}
+		if len(recipients) != 2 {
+			t.Fatalf("got %d recipients, want 2", len(recipients))
+		}
+		keys := make(map[string]struct{}, len(recipients))
+		for i, recipient := range recipients {
+			if _, ok := recipient["header"]; !ok {
+				t.Errorf("recipient %d has no header: %s", i, msg)
+			}
+			encryptedKey, ok := recipient["encrypted_key"]
+			if !ok {
+				t.Errorf("recipient %d has no encrypted_key: %s", i, msg)
+				continue
+			}
+			keys[string(encryptedKey)] = struct{}{}
+		}
+		if len(keys) != 2 {
+			t.Errorf("expected two distinct per-recipient encrypted keys, got %d", len(keys))
+		}
+	})
+
+	t.Run("recipients with top-level header is rejected", func(t *testing.T) {
+		msg := `{"protected":"eyJlbmMiOiJBMTI4R0NNIn0",` +
+			`"header":{"kid":""},` +
+			`"recipients":[{"header":{"alg":"RSA-OAEP"}},{"header":{"alg":"RSA-OAEP"}}],` +
+			`"iv":"AAAA","ciphertext":"AAAA","tag":"AAAA"}`
+		_, err := ParseEncryptedJSON(msg, []KeyAlgorithm{RSA_OAEP}, []ContentEncryption{A128GCM})
+		if !errors.Is(err, ErrConflictingRecipientMembers) {
+			t.Fatalf("parsing %s: got %v, want %v", msg, err, ErrConflictingRecipientMembers)
+		}
+		if !strings.Contains(err.Error(), `"header"`) {
+			t.Errorf("rejection should name the offending member \"header\": %v", err)
+		}
+		// The rejection must not be reported as a pre-existing missing-header
+		// error, otherwise callers cannot tell the two failure modes apart.
+		if strings.Contains(err.Error(), `missing header "alg"`) ||
+			strings.Contains(err.Error(), `missing header "enc"`) {
+			t.Errorf("rejection must not be reported as a missing header: %v", err)
+		}
+	})
+
+	t.Run("recipients with top-level encrypted_key is rejected", func(t *testing.T) {
+		msg := `{"protected":"eyJlbmMiOiJBMTI4R0NNIn0",` +
+			`"recipients":[{"header":{"alg":"RSA-OAEP"},"encrypted_key":"AAAA"},` +
+			`{"header":{"alg":"RSA-OAEP"},"encrypted_key":"BBBB"}],` +
+			`"encrypted_key":"AAAA",` +
+			`"iv":"AAAA","ciphertext":"AAAA","tag":"AAAA"}`
+		_, err := ParseEncryptedJSON(msg, []KeyAlgorithm{RSA_OAEP}, []ContentEncryption{A128GCM})
+		if !errors.Is(err, ErrConflictingRecipientMembers) {
+			t.Fatalf("parsing %s: got %v, want %v", msg, err, ErrConflictingRecipientMembers)
+		}
+		if !strings.Contains(err.Error(), `"encrypted_key"`) {
+			t.Errorf("rejection should name the offending member \"encrypted_key\": %v", err)
+		}
+		if strings.Contains(err.Error(), `missing header`) {
+			t.Errorf("rejection must not be reported as a missing header: %v", err)
+		}
+	})
+
+	t.Run("flattened and general roundtrips keep top-level structure", func(t *testing.T) {
+		flattened := newSingleRecipientJWE(t).FullSerialize()
+		general := newMultiRecipientJWE(t).FullSerialize()
+
+		for name, msg := range map[string]string{"flattened": flattened, "general": general} {
+			t.Run(name, func(t *testing.T) {
+				parsed, err := ParseEncryptedJSON(msg, []KeyAlgorithm{RSA_OAEP}, []ContentEncryption{A128GCM})
+				if err != nil {
+					t.Fatalf("parsing %s: %s", msg, err)
+				}
+				reSerialized := parsed.FullSerialize()
+				if reSerialized != msg {
+					t.Errorf("roundtrip changed serialization:\n%s\n%s", msg, reSerialized)
+				}
+
+				before := memberNames(topLevelMembers(t, msg))
+				after := memberNames(topLevelMembers(t, reSerialized))
+				if !slices.Equal(before, after) {
+					t.Errorf("roundtrip top-level members = %v, want %v", after, before)
+				}
+				if name == "general" {
+					for _, member := range before {
+						if member == "header" || member == "encrypted_key" {
+							t.Errorf("roundtrip reintroduced top-level %q member: %s", member, reSerialized)
+						}
+					}
+				}
+			})
+		}
+	})
+
 }
 
 func TestParseEncryptedMaxRecipients(t *testing.T) {
